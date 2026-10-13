@@ -1,73 +1,168 @@
+
 <!DOCTYPE html>
 <html lang="ja">
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Pico通信テスト</title>
+    <title>Pico通信テスト・ログ記録</title>
 </head>
-
 <body>
-
-    <h1>Pico通信テスト</h1>
+    <h1>Pico通信テスト・ログ記録</h1>
 
     <button id="connectButton">Picoに接続</button>
+    <button id="downloadButton" disabled>CSVを保存</button>
 
     <p id="status">未接続</p>
+    <p>受信行数：<span id="count">0</span></p>
+    <p>最新の生データ：<span id="raw">---</span></p>
+    <p>Pico経過時間：<span id="picoTime">---</span></p>
+    <p>センサ値：<span id="sensorValue">---</span></p>
+    <p>Web受信時刻：<span id="webTime">---</span> ms</p>
 
-    <p>受信データ：</p>
-    <div id="data">---</div>
+    <h2>直近のログ</h2>
+    <pre id="log">まだデータがありません</pre>
 
     <script>
         const connectButton = document.getElementById("connectButton");
+        const downloadButton = document.getElementById("downloadButton");
         const status = document.getElementById("status");
-        const dataDisplay = document.getElementById("data");
+        const countDisplay = document.getElementById("count");
+        const rawDisplay = document.getElementById("raw");
+        const picoTimeDisplay = document.getElementById("picoTime");
+        const sensorValueDisplay = document.getElementById("sensorValue");
+        const webTimeDisplay = document.getElementById("webTime");
+        const logDisplay = document.getElementById("log");
+
+        // 受信したログを保存する配列
+        const records = [];
+        let reader = null;
+        let port = null;
+        let buffer = "";
+        let webStartTime = null;
 
         connectButton.addEventListener("click", async () => {
-
             try {
-                const port = await navigator.serial.requestPort();
+                port = await navigator.serial.requestPort();
+                await port.open({ baudRate: 115200 });
 
-                await port.open({
-                    baudRate: 115200
-                });
-
-                status.textContent = "Picoに接続しました";
-
-
-                const reader = port.readable
+                reader = port.readable
                     .pipeThrough(new TextDecoderStream())
                     .getReader();
-                
-                let buffer = "";
-                
+
+                status.textContent = "Picoに接続しました。記録中です";
+                connectButton.disabled = true;
+                downloadButton.disabled = false;
+                webStartTime = performance.now();
+                buffer = "";
+
                 while (true) {
                     const { value, done } = await reader.read();
                     if (done) break;
-                
-                    if (value) {
-                        buffer += value;
-                
-                        const lines = buffer.split("\n");
-                        buffer = lines.pop();
-                
-                        for (const line of lines) {
-                            const text = line.trim();
-                
-                            if (text !== "") {
-                                dataDisplay.textContent = text;
+                    if (value === undefined) continue;
+
+                    // 受信した文字列を改行単位に分割する
+                    buffer += value;
+                    const lines = buffer.split("\n");
+                    buffer = lines.pop();
+
+                    for (const line of lines) {
+                        const rawLine = line.trim();
+                        if (rawLine === "") continue;
+
+                        const webMs = performance.now() - webStartTime;
+                        const columns = rawLine.split(",");
+
+                        // 生データは、形式が不正でも必ず記録する
+                        let picoMs = "";
+                        let sensorValue = "";
+                        let parseStatus = "OK";
+
+                        if (columns.length === 2) {
+                            const parsedTime = Number(columns[0].trim());
+                            const parsedSensor = Number(columns[1].trim());
+
+                            if (
+                                columns[0].trim() !== "" &&
+                                columns[1].trim() !== "" &&
+                                Number.isFinite(parsedTime) &&
+                                Number.isFinite(parsedSensor)
+                            ) {
+                                picoMs = parsedTime;
+                                sensorValue = parsedSensor;
+                            } else {
+                                parseStatus = "数値変換失敗";
                             }
+                        } else {
+                            parseStatus = "列数不一致";
                         }
+
+                        const record = {
+                            pico_ms: picoMs,
+                            web_ms: webMs.toFixed(1),
+                            raw_line: rawLine,
+                            sensor_value: sensorValue,
+                            parse_status: parseStatus
+                        };
+
+                        records.push(record);
+
+                        rawDisplay.textContent = rawLine;
+                        picoTimeDisplay.textContent =
+                            picoMs === "" ? "解析失敗" : picoMs;
+                        sensorValueDisplay.textContent =
+                            sensorValue === "" ? "解析失敗" : sensorValue;
+                        webTimeDisplay.textContent = webMs.toFixed(1);
+                        countDisplay.textContent = records.length;
+
+                        // 画面には直近20件だけ表示する
+                        const recent = records.slice(-20);
+                        logDisplay.textContent = recent.map(r =>
+                            `${r.pico_ms}\t${r.web_ms}\t${r.raw_line}\t${r.parse_status}`
+                        ).join("\n");
                     }
                 }
-
-
             } catch (error) {
-                status.textContent = "接続に失敗しました";
+                status.textContent = "接続または受信に失敗しました";
                 console.error(error);
+            } finally {
+                connectButton.disabled = false;
             }
+        });
 
+        downloadButton.addEventListener("click", () => {
+            if (records.length === 0) return;
+
+            const header = [
+                "pico_ms",
+                "web_ms",
+                "raw_line",
+                "sensor_value",
+                "parse_status"
+            ];
+
+            // CSVの区切り文字や引用符を安全に処理する
+            const escapeCsv = value =>
+                '"' + String(value).replace(/"/g, '""') + '"';
+
+            const csv = [
+                header.map(escapeCsv).join(","),
+                ...records.map(record =>
+                    header.map(key => escapeCsv(record[key])).join(",")
+                )
+            ].join("\r\n");
+
+            const blob = new Blob(
+                ["\uFEFF" + csv],
+                { type: "text/csv;charset=utf-8;" }
+            );
+
+            const url = URL.createObjectURL(blob);
+            const link = document.createElement("a");
+            link.href = url;
+            link.download = "pico_log.csv";
+            link.click();
+            URL.revokeObjectURL(url);
         });
     </script>
-
 </body>
 </html>
